@@ -4,12 +4,15 @@ Endpoints (interactive docs at /docs):
 
     GET  /                     service info
     GET  /config               effective default config + runtime info
-    POST /train/start          start a fresh run (optional config overrides, force)
+    POST /train/start          start a fresh run (optional config overrides,
+                               force; optional early stopping via
+                               early_stopping_patience + early_stopping_min_delta)
     POST /train/pause          stop training; 200 only after a full checkpoint is persisted
     POST /train/resume         continue from the latest checkpoint / paused state
-    GET  /train/status         progress and checkpoint health
+    GET  /train/status         progress, checkpoint health, early-stopping state
     GET  /train/losses         per-batch loss history
     GET  /train/parameters     download model parameters (.pt) from latest checkpoint
+                               (best-epoch weights when early stopping is enabled)
     GET  /train/checkpoint     download the full checkpoint (.pt)
 """
 from __future__ import annotations
@@ -45,11 +48,16 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Resumable Training API",
-    version="1.0.0",
+    version="1.1.0",
     description=(
         "Single-job CPU training service (two-layer FC net + Dropout + Adam). "
         "Pause/resume and kill/restart recovery reproduce uninterrupted runs "
-        "bit-exactly under the same environment, seed and config."
+        "bit-exactly under the same environment, seed and config. Optional "
+        "early stopping on the per-epoch mean training loss: configure "
+        "early_stopping_patience (2-8) and early_stopping_min_delta (finite, "
+        ">= 0) at /train/start; the checkpoint keeps both the live training "
+        "state and the best-epoch weights, and /train/parameters serves the "
+        "best-epoch weights once early stopping is enabled."
     ),
     lifespan=lifespan,
 )
@@ -98,7 +106,11 @@ def get_config() -> dict:
 
 @app.post("/train/start")
 def start(body: dict[str, Any] | None = Body(default=None)) -> dict:
-    """Start a fresh run. Body: {"force": bool, "config": {overrides}}."""
+    """Start a fresh run. Body: {"force": bool, "config": {overrides}}.
+
+    Early stopping (optional): set ``early_stopping_patience`` (int 2-8) and
+    ``early_stopping_min_delta`` (finite, >= 0) in the config overrides.
+    """
     body = body or {}
     force = bool(body.get("force", False))
     overrides = body.get("config") or {}
@@ -151,7 +163,11 @@ def losses(
 
 @app.get("/train/parameters")
 def parameters() -> Response:
-    """Download current model parameters (.pt) from the latest checkpoint."""
+    """Download model parameters (.pt) from the latest checkpoint.
+
+    When early stopping is enabled this is the best-epoch state dict;
+    otherwise the current one.
+    """
     try:
         data = manager.read_parameters()
     except NotFoundError as exc:

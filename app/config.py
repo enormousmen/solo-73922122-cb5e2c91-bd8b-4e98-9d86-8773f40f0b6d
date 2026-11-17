@@ -8,6 +8,7 @@ default config from a JSON file (path from ``CONFIG_PATH`` env var, default
 from __future__ import annotations
 
 import json
+import math
 import os
 from dataclasses import asdict, dataclass, fields
 from pathlib import Path
@@ -33,6 +34,13 @@ class TrainConfig:
     # How long POST /train/pause waits for the trainer to stop and persist
     # a full checkpoint before reporting a timeout.
     pause_timeout_seconds: float = 30.0
+    # Optional early stopping on the mean training loss of each epoch.
+    # Disabled when early_stopping_patience is None.  When enabled, the first
+    # epoch's mean loss becomes the initial best; a later epoch only resets
+    # the no-improvement counter when (best - epoch_mean) > min_delta;
+    # `patience` consecutive non-improving epochs stop the run.
+    early_stopping_patience: int | None = None
+    early_stopping_min_delta: float = 0.0
     # Service-level setting: CSV dataset used for every run.
     dataset_path: str = "data/classification.csv"
 
@@ -57,6 +65,21 @@ class TrainConfig:
             raise ValueError("pause_timeout_seconds must be > 0")
         if self.seed < 0:
             raise ValueError("seed must be >= 0")
+        p = self.early_stopping_patience
+        if p is not None:
+            if isinstance(p, bool) or not isinstance(p, int):
+                raise ValueError("early_stopping_patience must be an integer")
+            if not 2 <= p <= 8:
+                raise ValueError("early_stopping_patience must be in [2, 8]")
+        md = self.early_stopping_min_delta
+        if isinstance(md, bool) or not isinstance(md, (int, float)):
+            raise ValueError("early_stopping_min_delta must be a number")
+        if not math.isfinite(md) or md < 0:
+            raise ValueError("early_stopping_min_delta must be finite and >= 0")
+        if p is None and md != 0:
+            raise ValueError(
+                "early_stopping_min_delta requires early_stopping_patience "
+                "to be set (early stopping is disabled otherwise)")
 
     @classmethod
     def from_dict(cls, data: dict) -> "TrainConfig":

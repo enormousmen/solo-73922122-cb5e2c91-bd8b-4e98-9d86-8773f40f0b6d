@@ -17,6 +17,11 @@ Reproducibility design (bit-exact resume):
   position (``epoch``, ``next_batch``), the full loss history, the resolved
   config and a ``completed`` flag.  Checkpoints are only taken at batch
   boundaries, capturing the exact state "ready to run batch k".
+* Optional early stopping is evaluated at the epoch-end transition as a pure
+  function of the persisted loss history plus the early-stopping state carried
+  in every checkpoint (best epoch/loss/weights, no-improvement counter), so a
+  pause or kill + restart recomputes the identical decision and the run stops
+  after exactly the same epoch as an uninterrupted run.
 * Resume (after pause, or after a process kill + restart) restores all of the
   above and simply continues the same deterministic sequence, so every
   subsequent batch loss and the final parameters are bit-identical to an
@@ -120,6 +125,14 @@ class JobManager:
         self.next_batch = 0       # index (within epoch) of the NEXT batch to run
         self.losses: list[dict] = []
         self.completed = False
+        # "completed" (all epochs) or "early_stopped"; set when completed=True.
+        self.stop_reason: str | None = None
+        # Early-stopping state (persisted in every checkpoint).
+        self.best_epoch: int | None = None
+        self.best_loss: float | None = None
+        self.best_model_state: dict | None = None
+        self.epochs_without_improvement = 0
+        self.stopped_at_epoch: int | None = None
         self.recovered = False
         self.saving = False
         self.checkpoint_dirty = False   # in-memory progress newer than disk
@@ -159,6 +172,14 @@ class JobManager:
         self.next_batch = int(ckpt["next_batch"])
         self.losses = list(ckpt["losses"])
         self.completed = bool(ckpt["completed"])
+        self.stop_reason = ckpt.get("stop_reason") or (
+            "completed" if self.completed else None)
+        self.best_epoch = ckpt.get("best_epoch")
+        self.best_loss = ckpt.get("best_loss")
+        self.best_model_state = ckpt.get("best_model_state_dict")
+        self.epochs_without_improvement = int(
+            ckpt.get("epochs_without_improvement", 0))
+        self.stopped_at_epoch = ckpt.get("stopped_at_epoch")
         self.run_id = ckpt["run_id"]
         self.started_at = ckpt.get("started_at")
         self._saved_point = (self.epoch, self.next_batch)
@@ -277,7 +298,7 @@ class JobManager:
             bs = cfg.batch_size
             batches_per_epoch = (n + bs - 1) // bs
 
-            while self.epoch < cfg.epochs:
+            while not self.completed and self.epoch < cfg.epochs:
                 epoch = self.epoch
                 perm = epoch_permutation(cfg.seed, epoch, n)
                 for b in range(self.next_batch, batches_per_epoch):
@@ -325,12 +346,21 @@ class JobManager:
                 with self._cond:
                     self.epoch = epoch + 1
                     self.next_batch = 0
+                    self._update_early_stopping(epoch)
 
             with self._cond:
-                self.completed = True
+                # Reaching here with completed=True means early stopping (or a
+                # resume retrying the failed final save); otherwise all epochs
+                # are done.
+                if not self.completed:
+                    self.completed = True
+                    self.stop_reason = "completed"
             try:
                 self._save_checkpoint(force=True)
             except CheckpointError:
+                # The run must NOT report finished: nothing complete is
+                # persisted.  resume() (here or after a restart) re-enters the
+                # loop above, which is a no-op, and retries this save.
                 with self._cond:
                     self.state = JobState.FAILED
                     self._cond.notify_all()
@@ -344,6 +374,43 @@ class JobManager:
                 self.state = JobState.FAILED
                 self._cond.notify_all()
 
+    def _update_early_stopping(self, epoch: int) -> None:
+        """Epoch-end early-stopping update.  Trainer thread, lock held.
+
+        The epoch mean is a pure function of the persisted per-batch loss
+        history (summed in step order), and the ES state is carried in every
+        checkpoint, so after a pause/kill + resume this recomputes the
+        identical decision and captures the identical best weights.
+        """
+        cfg = self.cfg
+        if cfg.early_stopping_patience is None:
+            return
+        total = 0.0
+        count = 0
+        for entry in self.losses:
+            if entry["epoch"] == epoch:
+                total += entry["loss"]
+                count += 1
+        epoch_mean = total / count
+        if (self.best_loss is None
+                or (self.best_loss - epoch_mean) > cfg.early_stopping_min_delta):
+            # First epoch is the initial best; later epochs must improve on
+            # the best by more than min_delta.
+            self.best_loss = epoch_mean
+            self.best_epoch = epoch
+            # Clone: state_dict tensors alias the live model parameters.
+            self.best_model_state = {
+                k: v.detach().clone()
+                for k, v in self.model.state_dict().items()
+            }
+            self.epochs_without_improvement = 0
+        else:
+            self.epochs_without_improvement += 1
+            if self.epochs_without_improvement >= cfg.early_stopping_patience:
+                self.completed = True
+                self.stop_reason = "early_stopped"
+                self.stopped_at_epoch = epoch
+
     # -------------------------------------------------------------- checkpoint
 
     def _save_checkpoint(self, force: bool = False) -> None:
@@ -354,10 +421,18 @@ class JobManager:
             "epoch": self.epoch,
             "next_batch": self.next_batch,
             "completed": self.completed,
+            "stop_reason": self.stop_reason,
             "losses": self.losses,
             "model_state_dict": self.model.state_dict(),
             "optimizer_state_dict": self.optimizer.state_dict(),
             "rng_state": torch.get_rng_state(),
+            # Early-stopping state: the current training scene AND the
+            # best-epoch weights live side by side in every checkpoint.
+            "best_epoch": self.best_epoch,
+            "best_loss": self.best_loss,
+            "best_model_state_dict": self.best_model_state,
+            "epochs_without_improvement": self.epochs_without_improvement,
+            "stopped_at_epoch": self.stopped_at_epoch,
             "started_at": self.started_at,
             "saved_at": _now_iso(),
         }
@@ -403,6 +478,8 @@ class JobManager:
                 "total_batches": total,
                 "completed_batches": done,
                 "progress": (done / total) if total else 0.0,
+                "stop_reason": self.stop_reason,
+                "early_stopping": self._early_stopping_status(),
                 "saving": self.saving,
                 "checkpoint_dirty": self.checkpoint_dirty,
                 "last_checkpoint_at": self.last_checkpoint_at,
@@ -417,6 +494,21 @@ class JobManager:
                 },
             }
 
+    def _early_stopping_status(self) -> dict | None:
+        """Early-stopping progress; None when the run has ES disabled."""
+        cfg = self.cfg
+        if cfg is None or cfg.early_stopping_patience is None:
+            return None
+        return {
+            "enabled": True,
+            "patience": cfg.early_stopping_patience,
+            "min_delta": cfg.early_stopping_min_delta,
+            "best_epoch": self.best_epoch,
+            "best_loss": self.best_loss,
+            "epochs_without_improvement": self.epochs_without_improvement,
+            "stopped_at_epoch": self.stopped_at_epoch,
+        }
+
     def get_losses(self, since_step: int | None = None, limit: int | None = None) -> dict:
         with self._cond:
             losses = list(self.losses)
@@ -428,12 +520,17 @@ class JobManager:
         return {"count": total, "returned": len(losses), "losses": losses}
 
     def read_parameters(self) -> bytes:
-        """Model parameters from the latest persisted checkpoint, as a .pt file."""
+        """Model parameters from the latest persisted checkpoint, as a .pt file.
+
+        With early stopping enabled this serves the best-epoch weights (the
+        ones the engineer wants to keep); otherwise the current weights.
+        """
         ckpt = load_checkpoint(self.runs_dir)
         if ckpt is None:
             raise NotFoundError("no checkpoint exists yet; train first")
+        state = ckpt.get("best_model_state_dict") or ckpt["model_state_dict"]
         buf = io.BytesIO()
-        torch.save(ckpt["model_state_dict"], buf)
+        torch.save(state, buf)
         return buf.getvalue()
 
     def checkpoint_file(self) -> Path:

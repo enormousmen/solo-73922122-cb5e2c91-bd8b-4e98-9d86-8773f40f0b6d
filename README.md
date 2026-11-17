@@ -2,12 +2,14 @@
 
 FastAPI + CPU 版 PyTorch 实现的**单作业训练服务**。训练工程师在作业被抢占（暂停、
 进程强退、容器被杀）后，可以从最近成功的检查点继续训练；在**同环境、同种子、同
-配置**下，恢复后的逐批损失与最终参数与**不中断训练逐位一致**。
+配置**下，恢复后的逐批损失与最终参数与**不中断训练逐位一致**。支持**可选早停**：
+损失停滞后自动停机，并随时可下载训练中表现最好的参数。
 
 - 模型：两层全连接网络 `Linear → ReLU → Dropout → Linear`
 - 优化器：Adam；每轮（epoch）打乱全部样本后按批训练
 - 数据：仓库内置固定分类数据集 `data/classification.csv`（600 样本 / 2 特征 / 3 类）
 - 默认配置：`config/default.json`（可在启动时按字段覆盖）
+- 早停：可选 `early_stopping_patience` + `early_stopping_min_delta`（见下文）
 
 ## 目录结构
 
@@ -54,10 +56,10 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | POST | `/train/start` | 启动新训练。Body: `{"force": false, "config": {覆盖字段}}` |
 | POST | `/train/pause` | 暂停。**训练停止且完整检查点持久化后才返回 200** |
 | POST | `/train/resume` | 从暂停态/最近检查点续训（并发只放行一个训练者） |
-| GET | `/train/status` | 状态与进度（epoch/batch/百分比/检查点健康度） |
+| GET | `/train/status` | 状态与进度（epoch/batch/百分比/检查点健康度/早停状态/停止原因） |
 | GET | `/train/losses` | 逐批损失（支持 `since_step`、`limit`） |
-| GET | `/train/parameters` | 下载当前模型参数（.pt，取自最近持久化检查点） |
-| GET | `/train/checkpoint` | 下载完整检查点（模型+优化器+RNG+历史） |
+| GET | `/train/parameters` | 下载模型参数（.pt，取自最近持久化检查点；开启早停时为**最佳轮权重**） |
+| GET | `/train/checkpoint` | 下载完整检查点（模型+优化器+RNG+历史+早停状态） |
 
 交互式文档（Swagger UI）在 `/docs`，可直接在浏览器里调通上述接口。
 
@@ -89,6 +91,40 @@ curl -OJ localhost:8000/train/checkpoint     # checkpoint.pt
 `failed`）。`paused` 表示训练已停、可续训；`checkpoint_dirty=true` 表示内存进度
 领先于磁盘（上次保存失败），此时重启进程会回退到磁盘上的旧检查点。
 
+## 可选早停（early stopping）
+
+启动时在 `config` 覆盖中填写两个字段即可开启（默认关闭）：
+
+| 字段 | 约束 | 含义 |
+|---|---|---|
+| `early_stopping_patience` | 整数 2～8 | 连续多少轮未改善即停 |
+| `early_stopping_min_delta` | 有限、≥ 0 | 判定"改善"的最小幅度 |
+
+规则：每轮结束取该轮**全部批次训练损失的均值**；首轮均值即为初始最佳；之后仅当
+`旧最佳 - 本轮均值 > min_delta` 才更新最佳（并保存该轮权重副本）且计数清零，否则
+计数 +1；连续 `patience` 轮未改善立即停止。只填 `min_delta` 不填 `patience` 视为
+配置错误（400）。
+
+```bash
+curl -X POST localhost:8000/train/start -H 'Content-Type: application/json' -d '{
+  "config": {"epochs": 50, "early_stopping_patience": 3,
+             "early_stopping_min_delta": 0.01}}'
+```
+
+开启后：
+
+- `GET /train/status` 增加 `stop_reason`（`completed` / `early_stopped`）与
+  `early_stopping` 块（`best_epoch`、`best_loss`、`epochs_without_improvement`、
+  `stopped_at_epoch`），训练中即可观察早停进度；早停成功后状态明确给出最佳轮、
+  最佳损失与停止原因。
+- 每个检查点同时保存**当前训练现场**（模型+优化器+RNG+位置）与**最佳轮权重**；
+  `GET /train/parameters` 在开启早停后返回最佳轮权重（未开启时仍为当前权重），
+  `GET /train/checkpoint` 的完整检查点里两者都有。
+- 暂停/强退后续训的**停止轮次、逐批损失与下载参数**与同配置不中断运行逐位一致
+  （早停判定是损失历史的纯函数，恢复后重放同一确定性序列，见下节）。
+- 早停触发时的最终保存若失败，运行进入 `failed` 而**不会**报 `finished`，旧检查
+  点保持完整；`POST /train/resume`（或重启后续训）会重试该保存，进度查询全程可用。
+
 ## 可复现性设计（为什么恢复后逐位一致）
 
 1. **单线程 + 确定性算子**：`torch.set_num_threads(1)` 并开启
@@ -100,7 +136,10 @@ curl -OJ localhost:8000/train/checkpoint     # checkpoint.pt
 4. **批边界检查点**：每个检查点记录 `epoch`、`next_batch`、模型与 Adam 状态、
    RNG 状态、完整损失历史、解析后的配置与 `completed` 标志——即"准备执行第 k
    批"的完整现场。恢复 = 还原现场后继续同一确定性序列。
-5. **原子写**：先写 `.checkpoint.pt.tmp.<uuid>` → fsync → `os.replace` 原子改名
+5. **早停状态随检查点持久化**：最佳轮、最佳损失、最佳轮权重副本与未改善计数都
+   写入每个检查点；轮末判定时该轮均值按步序对损失历史求和，是纯函数，因此暂停/
+   强退后重放得到同一判定、同一最佳权重、同一停止轮次。
+6. **原子写**：先写 `.checkpoint.pt.tmp.<uuid>` → fsync → `os.replace` 原子改名
    → 目录 fsync。保存中被强退，磁盘上只会是**完整的旧点或完整的新点**；
    启动时清理残留的临时文件。保存失败不触碰旧文件，明确报错，可重试。
 
@@ -118,8 +157,12 @@ python3 scripts/verify_repro.py
 脚本会真实拉起 uvicorn 服务进程，依次验证（详见脚本 docstring）：
 A 不中断基线；B 暂停+续训；C 强退+重启+续训；D 并发续训只放行一个；
 E1 保存失败→报错→旧点保留→重试成功；E2 保存失败后强退→回退旧点恢复；
-F 慢保存不挡查询；G 保存进行中强退→恢复完整旧/新点；H 基础接口与 /docs。
-B–E、G 的逐批损失与最终参数均与各自不中断基线**逐位一致**才判通过。
+F 慢保存不挡查询；G 保存进行中强退→恢复完整旧/新点；H 基础接口与 /docs；
+I 早停基线（到点自停、状态给出最佳轮/最佳损失/停止原因、参数下载为最佳轮权重）；
+J 早停+暂停续训；K 早停+强退重启续训；L1 早停最终保存失败→报 failed 而非
+finished→重试成功；L2 保存失败后再强退→回退旧点续训；M 早停参数校验（400）；
+N 早停未触发时正常跑完全部轮次。B–E、G、J–L 的逐批损失、停止轮次与下载参数
+均与各自不中断基线**逐位一致**才判通过。
 
 > 本环境的 seccomp 策略禁止向其他进程发信号，脚本用 `ENABLE_TEST_CRASH_ENDPOINT=1`
 > 开启的测试专用 `POST /test/crash`（`os._exit`，立即死亡、无任何清理）模拟强退；
@@ -147,33 +190,33 @@ curl -s localhost:8000/train/status    # 直至 state=finished
 （以下为 `python3 scripts/verify_repro.py` 在本仓库环境下的真实输出摘要）
 
 ```
-    workdir: /tmp/verify-repro-ndor_el1
-    
+    workdir: /tmp/verify-repro-9yee0xwt
+
     == H: service basics (idle server) ==
       [PASS] H1 GET /
       [PASS] H2 GET /docs (Swagger UI)
       [PASS] H3 parameters before any checkpoint -> 404
       [PASS] H4 resume with no run -> 404
       [PASS] H5 pause while idle -> 409
-    
+
     == A: uninterrupted baseline ==
       [PASS] A baseline finished - 95 batches, final loss 0.027771
-    
+
     == B: pause + resume ==
-      [PASS] B1 pause returns only after checkpoint persisted - pause latency 0.03s, stopped at batch 14
+      [PASS] B1 pause returns only after checkpoint persisted - pause latency 0.04s, stopped at batch 14
       [PASS] B2 resume accepted
         losses: 95 entries, exact match
         params: all tensors bit-identical (sha256 2397ddd7b6b8b70b == 2397ddd7b6b8b70b)
       [PASS] B3 pause+resume == uninterrupted
-    
+
     == D: concurrent resume starts exactly one trainer ==
       [PASS] D1 concurrent resumes -> one 200, one 409 - got [200, 409]
         losses: 95 entries, exact match
         params: all tensors bit-identical (sha256 2397ddd7b6b8b70b == 2397ddd7b6b8b70b)
       [PASS] D2 resumed run == uninterrupted
-    
+
     == E1: checkpoint save failure keeps old checkpoint, retry works ==
-      [PASS] E1 pause with failing save -> 500 - training is stopped but the checkpoint could not be persisted; the previous checkpoint is intact on 
+      [PASS] E1 pause with failing save -> 500 - training is stopped but the checkpoint could not be persisted; ...
       [PASS] E1 status shows dirty checkpoint + error
       [PASS] E1 old checkpoint untouched
       [PASS] E1 retried pause -> 200, checkpoint persisted
@@ -181,12 +224,12 @@ curl -s localhost:8000/train/status    # 直至 state=finished
         losses: 95 entries, exact match
         params: all tensors bit-identical (sha256 2397ddd7b6b8b70b == 2397ddd7b6b8b70b)
       [PASS] E1 run after save-failure == uninterrupted
-    
+
     == F: slow checkpoint saves do not block queries ==
       [PASS] F1 queries respond fast while a 1s save is in flight - worst status latency 1ms
       [PASS] F2 pause during slow saves
       [PASS] F3 slow-save run finishes
-    
+
     == C: hard crash + restart recovers from latest checkpoint ==
       [PASS] C1 server crashed mid-run
       [PASS] C2 restart recovers paused state from checkpoint - recovered at batch 10/95
@@ -194,7 +237,7 @@ curl -s localhost:8000/train/status    # 直至 state=finished
         losses: 95 entries, exact match
         params: all tensors bit-identical (sha256 2397ddd7b6b8b70b == 2397ddd7b6b8b70b)
       [PASS] C4 kill+restart == uninterrupted
-    
+
     == E2: save failure, then hard crash -> old checkpoint used ==
       [PASS] E2 pause with failing save -> 500
       [PASS] E2 restart falls back to old complete checkpoint - recovered at batch 6/95
@@ -202,7 +245,7 @@ curl -s localhost:8000/train/status    # 直至 state=finished
         losses: 95 entries, exact match
         params: all tensors bit-identical (sha256 2397ddd7b6b8b70b == 2397ddd7b6b8b70b)
       [PASS] E2 save-fail+kill == uninterrupted
-    
+
     == G: hard crash in the middle of a checkpoint save ==
       (baseline: identical config, uninterrupted)
       [PASS] G1 server crashed during save
@@ -212,9 +255,64 @@ curl -s localhost:8000/train/status    # 直至 state=finished
         losses: 19 entries, exact match
         params: all tensors bit-identical (sha256 1353a7415c7cae90 == 1353a7415c7cae90)
       [PASS] G4 kill-mid-save == uninterrupted
-    
+
+    == I: early-stopping baseline (uninterrupted) ==
+      [PASS] I1 early stop after `patience` non-improving epochs - stopped at epoch 3, best_epoch=0, best_loss=1.180349, batches=76/228
+      [PASS] I2 /train/parameters returns best-epoch weights
+      [PASS] I3 best_loss == epoch-0 mean of batch losses
+
+    == J: early stopping + pause/resume ==
+      [PASS] J1 pause mid-run
+      [PASS] J2 resume accepted
+        losses: 76 entries, exact match
+        params: all tensors bit-identical (sha256 59fc4284de57c632 == 59fc4284de57c632)
+      [PASS] J3 pause+resume ES == uninterrupted
+      [PASS] J4 ES status identical to baseline - stop_reason=early_stopped epoch=4 best_epoch=0
+
+    == K: early stopping + hard crash + restart ==
+      [PASS] K1 server crashed mid-run
+      [PASS] K2 restart recovers paused state incl. ES progress - recovered at batch 44, best_epoch=0
+      [PASS] K3 resume after restart
+        losses: 76 entries, exact match
+        params: all tensors bit-identical (sha256 59fc4284de57c632 == 59fc4284de57c632)
+      [PASS] K4 kill+restart ES == uninterrupted
+      [PASS] K5 ES status identical to baseline - stop_reason=early_stopped epoch=4 best_epoch=0
+
+    == L1: early-stop final save failure must not report finished ==
+      [PASS] L1 failed (never finished) when the early-stop save fails - state=failed dirty=True
+      [PASS] L1 status queries stay available while failed
+      [PASS] L1 persisted checkpoint still the old incomplete one
+      [PASS] L1 resume retries the final save
+        losses: 76 entries, exact match
+        params: all tensors bit-identical (sha256 59fc4284de57c632 == 59fc4284de57c632)
+      [PASS] L1 run after failed save == baseline
+      [PASS] L1 ES status identical to baseline - stop_reason=early_stopped epoch=4 best_epoch=0
+
+    == L2: early-stop save failure + hard crash before retry ==
+      [PASS] L2 final save failed before crash
+      [PASS] L2 restart recovers last good checkpoint (not finished) - recovered at batch 57
+      [PASS] L2 resume after restart
+        losses: 76 entries, exact match
+        params: all tensors bit-identical (sha256 59fc4284de57c632 == 59fc4284de57c632)
+      [PASS] L2 kill-after-failed-save == baseline
+      [PASS] L2 ES status identical to baseline - stop_reason=early_stopped epoch=4 best_epoch=0
+
+    == M: early-stopping config validation ==
+      [PASS] M invalid config -> 400 (patience=1) - got 400
+      [PASS] M invalid config -> 400 (patience=9) - got 400
+      [PASS] M invalid config -> 400 (patience=2.5) - got 400
+      [PASS] M invalid config -> 400 (min_delta=-0.5) - got 400
+      [PASS] M invalid config -> 400 (min_delta=NaN) - got 400
+      [PASS] M invalid config -> 400 (min_delta=+inf) - got 400
+      [PASS] M invalid config -> 400 (min_delta without patience) - got 400
+      [PASS] M valid ES config -> 200 - got 200
+
+    == N: early stopping enabled but never triggered ==
+      [PASS] N1 runs all epochs, stop_reason=completed - best_epoch=3
+      [PASS] N2 parameters == best-epoch weights
+
     ================ SUMMARY ================
-      33/33 checks passed（逐项明细同上，全部 PASS）
+      66/66 checks passed（逐项明细同上，全部 PASS）
 
 ```
 
@@ -228,7 +326,9 @@ curl -s localhost:8000/train/status    # 直至 state=finished
   前崩溃，则无点可恢复（状态回到 `idle`），只能重新开始——这是刻意语义，
   避免"已丢弃的旧运行"在重启后被悄悄恢复。
 - `GET /train/parameters` 取自最近**已持久化**检查点，运行中可能落后最多
-  `checkpoint_every` 批；未提供"当前内存参数"下载（避免与训练线程竞争）。
+  `checkpoint_every` 批；未提供"当前内存参数"下载（避免与训练线程竞争）。开启
+  早停后该接口返回截至最近检查点的**最佳轮**权重（首轮结束起即有最佳），未开启
+  时返回当前权重。
 - 本环境无 docker，镜像构建与 compose 未实际执行；Dockerfile/compose 与本地实
   测使用完全相同的启动命令与依赖版本，但未在真实 Docker 中跑过验证脚本。
 - 暂停等待上限为 `pause_timeout_seconds`（默认 30s），超时返回 504，训练仍会

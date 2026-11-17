@@ -17,6 +17,21 @@ baseline (identical seed + config):
                                          new) checkpoint, resume reproduces
                                          G-baseline
   H   service basics                  -> /, /docs, 404s before first checkpoint
+  I   early-stopping baseline         -> stops after `patience` non-improving
+                                         epochs; status exposes best epoch /
+                                         best loss / stop reason; parameters
+                                         download returns best-epoch weights
+  J   early stopping + pause/resume   -> stop epoch, losses, params, ES status
+                                         bit-identical to I
+  K   early stopping + kill/restart   -> bit-identical to I
+  L1  early-stop final save failure   -> state=failed (never finished), queries
+                                         stay live, resume retries the save and
+                                         reproduces I
+  L2  L1 + hard crash before retry    -> restart recovers last good checkpoint,
+                                         resume still reproduces I
+  M   early-stopping config validation-> 400 for bad patience/min_delta
+  N   early stopping not triggered    -> runs all epochs, stop_reason=completed,
+                                         parameters still best-epoch weights
 
 Exit code 0 iff every scenario passes.  Run from the repo root:
 
@@ -53,6 +68,20 @@ CFG_SLOW_SAVE = {"epochs": 1, "batch_size": 32, "batch_sleep_seconds": 0.03,
 # Scenario G: kill mid-save, short run.
 CFG_KILL_SAVE = {"epochs": 1, "batch_size": 32, "batch_sleep_seconds": 0.03,
                  "checkpoint_every": 1, "checkpoint_sleep_seconds": 0.5}
+# Scenarios I-L: early stopping.  min_delta=1.0 exceeds any realistic
+# epoch-to-epoch mean change, so every epoch is "not improving" and the run
+# stops deterministically after patience+1 epochs (best = epoch 0).
+CFG_ES = {"epochs": 12, "batch_size": 32, "batch_sleep_seconds": 0.03,
+          "checkpoint_every": 2, "checkpoint_sleep_seconds": 0.0,
+          "lr": 1e-6,
+          "early_stopping_patience": 3, "early_stopping_min_delta": 1.0}
+ES_BATCHES_PER_EPOCH = 19          # ceil(600 / 32)
+ES_STOP_EPOCH = 3                  # 0-based index of the last executed epoch
+ES_TOTAL_BATCHES = (ES_STOP_EPOCH + 1) * ES_BATCHES_PER_EPOCH
+# Scenario N: ES enabled but patience exceeds the epoch count -> never stops.
+CFG_ES_NO_TRIGGER = {"epochs": 4, "batch_size": 32, "batch_sleep_seconds": 0.03,
+                     "checkpoint_every": 2, "checkpoint_sleep_seconds": 0.0,
+                     "early_stopping_patience": 8, "early_stopping_min_delta": 0.0}
 
 RESULTS: list[tuple[str, bool, str]] = []
 
@@ -419,6 +448,218 @@ def scenario_kill_mid_save(runs_dir: Path, log_dir: Path, server: Server) -> Ser
     return server2
 
 
+# ------------------------------------------------------- early stopping (ES)
+
+def run_es_to_finish(port: int, cfg: dict) -> tuple[dict, list, bytes]:
+    """Start a run and wait for 'finished'; return (status, losses, params)."""
+    start_run(port, cfg)
+    st = wait_state(port, "finished")
+    _, losses = api(port, "GET", "/train/losses")
+    params = api_bytes(port, "/train/parameters")
+    return st, losses["losses"], params
+
+
+def compare_es_status(name: str, ref: dict, got: dict) -> bool:
+    """Stop epoch, progress and ES fields must match the baseline exactly."""
+    keys = ["stop_reason", "epoch", "next_batch", "completed_batches",
+            "total_batches"]
+    es_keys = ["patience", "min_delta", "best_epoch", "best_loss",
+               "epochs_without_improvement", "stopped_at_epoch"]
+    ok = all(got.get(k) == ref.get(k) for k in keys)
+    ref_es, got_es = ref.get("early_stopping"), got.get("early_stopping")
+    ok = ok and ref_es is not None and got_es is not None
+    if ok:
+        ok = all(got_es[k] == ref_es[k] for k in es_keys)
+    record(name, ok,
+           f"stop_reason={got.get('stop_reason')} epoch={got.get('epoch')} "
+           f"best_epoch={got_es and got_es.get('best_epoch')}")
+    return ok
+
+
+def scenario_es_baseline(port: int) -> tuple[dict, list, bytes]:
+    print("\n== I: early-stopping baseline (uninterrupted) ==")
+    st, losses, params = run_es_to_finish(port, CFG_ES)
+    es = st["early_stopping"]
+    ok = (st["stop_reason"] == "early_stopped"
+          and es["best_epoch"] == 0
+          and es["stopped_at_epoch"] == ES_STOP_EPOCH
+          and es["epochs_without_improvement"] == CFG_ES["early_stopping_patience"]
+          and st["epoch"] == ES_STOP_EPOCH + 1
+          and st["completed_batches"] == ES_TOTAL_BATCHES
+          and len(losses) == ES_TOTAL_BATCHES)
+    record("I1 early stop after `patience` non-improving epochs", ok,
+           f"stopped at epoch {es['stopped_at_epoch']}, "
+           f"best_epoch={es['best_epoch']}, best_loss={es['best_loss']:.6f}, "
+           f"batches={st['completed_batches']}/{st['total_batches']}")
+    # The parameter download must be the BEST-epoch weights (epoch 0 here),
+    # not the current weights of the final executed epoch.
+    ckpt = torch.load(io.BytesIO(api_bytes(port, "/train/checkpoint")),
+                      weights_only=True)
+    got = torch.load(io.BytesIO(params), weights_only=True)
+    best, cur = ckpt["best_model_state_dict"], ckpt["model_state_dict"]
+    ok = (all(torch.equal(got[k], best[k]) for k in got)
+          and not all(torch.equal(got[k], cur[k]) for k in got))
+    record("I2 /train/parameters returns best-epoch weights", ok)
+    mean0 = sum(l["loss"] for l in losses
+                if l["epoch"] == 0) / ES_BATCHES_PER_EPOCH
+    record("I3 best_loss == epoch-0 mean of batch losses",
+           mean0 == es["best_loss"])
+    return st, losses, params
+
+
+def scenario_es_pause_resume(port: int, ref: tuple[dict, list, bytes]) -> None:
+    print("\n== J: early stopping + pause/resume ==")
+    start_run(port, CFG_ES)
+    wait_until(port, lambda s: s["completed_batches"] >= 30)
+    code, st = api(port, "POST", "/train/pause")
+    record("J1 pause mid-run", code == 200 and st["state"] == "paused")
+    code, _ = api(port, "POST", "/train/resume")
+    record("J2 resume accepted", code == 200)
+    st = wait_state(port, "finished")
+    _, losses = api(port, "GET", "/train/losses")
+    params = api_bytes(port, "/train/parameters")
+    compare_to_baseline("J3 pause+resume ES == uninterrupted",
+                        ref[1], ref[2], losses["losses"], params)
+    compare_es_status("J4 ES status identical to baseline", ref[0], st)
+
+
+def scenario_es_kill_restart(runs_dir: Path, log_dir: Path, server: Server,
+                             ref: tuple[dict, list, bytes]) -> Server:
+    print("\n== K: early stopping + hard crash + restart ==")
+    start_run(server.port, CFG_ES)
+    wait_until(server.port, lambda s: s["completed_batches"] >= 45
+               and s["last_checkpoint_at"] is not None)
+    server.kill()
+    record("K1 server crashed mid-run", True)
+    server2 = Server(runs_dir, log_dir, "K-restarted")
+    code, st = api(server2.port, "GET", "/train/status")
+    es = st.get("early_stopping") or {}
+    record("K2 restart recovers paused state incl. ES progress",
+           st["state"] == "paused" and st["recovered_after_restart"]
+           and es.get("best_epoch") is not None
+           and 0 < st["completed_batches"] < ES_TOTAL_BATCHES,
+           f"recovered at batch {st['completed_batches']}, "
+           f"best_epoch={es.get('best_epoch')}")
+    code, _ = api(server2.port, "POST", "/train/resume")
+    record("K3 resume after restart", code == 200)
+    st = wait_state(server2.port, "finished")
+    _, losses = api(server2.port, "GET", "/train/losses")
+    params = api_bytes(server2.port, "/train/parameters")
+    compare_to_baseline("K4 kill+restart ES == uninterrupted",
+                        ref[1], ref[2], losses["losses"], params)
+    compare_es_status("K5 ES status identical to baseline", ref[0], st)
+    return server2
+
+
+def _arm_failures_in_last_epoch(port: int, runs_dir: Path) -> Path:
+    """Arm save-failure injection once the run is inside its final epoch."""
+    first_batch_of_last_epoch = ES_STOP_EPOCH * ES_BATCHES_PER_EPOCH
+    wait_until(port, lambda s: s["completed_batches"] > first_batch_of_last_epoch
+               and s["last_checkpoint_at"] is not None)
+    flag = runs_dir / "INJECT_SAVE_FAILURES"
+    flag.write_text("1")
+    return flag
+
+
+def scenario_es_final_save_failure(port: int, runs_dir: Path,
+                                   ref: tuple[dict, list, bytes]) -> None:
+    print("\n== L1: early-stop final save failure must not report finished ==")
+    start_run(port, CFG_ES)
+    flag = _arm_failures_in_last_epoch(port, runs_dir)
+    st = wait_state(port, "failed", timeout=60)
+    record("L1 failed (never finished) when the early-stop save fails",
+           st["state"] == "failed" and st["checkpoint_dirty"]
+           and st["stop_reason"] == "early_stopped",
+           f"state={st['state']} dirty={st['checkpoint_dirty']}")
+    code, _ = api(port, "GET", "/train/status")
+    record("L1 status queries stay available while failed", code == 200)
+    ckpt = torch.load(runs_dir / "checkpoint.pt", weights_only=True)
+    record("L1 persisted checkpoint still the old incomplete one",
+           ckpt["completed"] is False)
+    flag.unlink()                             # fix the "storage"
+    code, _ = api(port, "POST", "/train/resume")
+    record("L1 resume retries the final save", code == 200)
+    st = wait_state(port, "finished")
+    _, losses = api(port, "GET", "/train/losses")
+    params = api_bytes(port, "/train/parameters")
+    compare_to_baseline("L1 run after failed save == baseline",
+                        ref[1], ref[2], losses["losses"], params)
+    compare_es_status("L1 ES status identical to baseline", ref[0], st)
+
+
+def scenario_es_save_failure_then_kill(runs_dir: Path, log_dir: Path,
+                                       server: Server,
+                                       ref: tuple[dict, list, bytes]) -> Server:
+    print("\n== L2: early-stop save failure + hard crash before retry ==")
+    start_run(server.port, CFG_ES)
+    flag = _arm_failures_in_last_epoch(server.port, runs_dir)
+    st = wait_state(server.port, "failed", timeout=60)
+    record("L2 final save failed before crash",
+           st["state"] == "failed" and st["checkpoint_dirty"])
+    server.kill()                             # die while dirty
+    flag.unlink()
+    server2 = Server(runs_dir, log_dir, "L2-restarted")
+    code, st = api(server2.port, "GET", "/train/status")
+    record("L2 restart recovers last good checkpoint (not finished)",
+           st["state"] == "paused" and st["recovered_after_restart"]
+           and st["stop_reason"] is None
+           and 0 < st["completed_batches"] < ES_TOTAL_BATCHES,
+           f"recovered at batch {st['completed_batches']}")
+    code, _ = api(server2.port, "POST", "/train/resume")
+    record("L2 resume after restart", code == 200)
+    st = wait_state(server2.port, "finished")
+    _, losses = api(server2.port, "GET", "/train/losses")
+    params = api_bytes(server2.port, "/train/parameters")
+    compare_to_baseline("L2 kill-after-failed-save == baseline",
+                        ref[1], ref[2], losses["losses"], params)
+    compare_es_status("L2 ES status identical to baseline", ref[0], st)
+    return server2
+
+
+def scenario_es_validation(port: int) -> None:
+    print("\n== M: early-stopping config validation ==")
+    bad = [
+        ("patience=1", {"early_stopping_patience": 1}),
+        ("patience=9", {"early_stopping_patience": 9}),
+        ("patience=2.5", {"early_stopping_patience": 2.5}),
+        ("min_delta=-0.5",
+         {"early_stopping_patience": 3, "early_stopping_min_delta": -0.5}),
+        ("min_delta=NaN",
+         {"early_stopping_patience": 3, "early_stopping_min_delta": float("nan")}),
+        ("min_delta=+inf",
+         {"early_stopping_patience": 3, "early_stopping_min_delta": float("inf")}),
+        ("min_delta without patience", {"early_stopping_min_delta": 0.5}),
+    ]
+    for label, cfg in bad:
+        code, _ = api(port, "POST", "/train/start",
+                      {"force": True, "config": cfg})
+        record(f"M invalid config -> 400 ({label})", code == 400,
+               f"got {code}")
+    code, _ = api(port, "POST", "/train/start",
+                  {"force": True, "config": {"epochs": 1,
+                                             "early_stopping_patience": 2}})
+    record("M valid ES config -> 200", code == 200, f"got {code}")
+    wait_state(port, "finished")
+
+
+def scenario_es_no_trigger(port: int) -> None:
+    print("\n== N: early stopping enabled but never triggered ==")
+    st, losses, params = run_es_to_finish(port, CFG_ES_NO_TRIGGER)
+    es = st["early_stopping"]
+    ok = (st["stop_reason"] == "completed"
+          and st["completed_batches"] == st["total_batches"]
+          and es is not None and es["best_epoch"] is not None
+          and es["stopped_at_epoch"] is None)
+    record("N1 runs all epochs, stop_reason=completed", ok,
+           f"best_epoch={es and es['best_epoch']}")
+    ckpt = torch.load(io.BytesIO(api_bytes(port, "/train/checkpoint")),
+                      weights_only=True)
+    got = torch.load(io.BytesIO(params), weights_only=True)
+    best = ckpt["best_model_state_dict"]
+    record("N2 parameters == best-epoch weights",
+           all(torch.equal(got[k], best[k]) for k in got))
+
+
 # ---------------------------------------------------------------------- main
 
 def main() -> int:
@@ -446,6 +687,15 @@ def main() -> int:
         server = scenario_save_failure_then_kill(runs_dir, log_dir, server,
                                                  (ref_losses, ref_params))
         server = scenario_kill_mid_save(runs_dir, log_dir, server)
+
+        es_ref = scenario_es_baseline(server.port)
+        scenario_es_pause_resume(server.port, es_ref)
+        server = scenario_es_kill_restart(runs_dir, log_dir, server, es_ref)
+        scenario_es_final_save_failure(server.port, runs_dir, es_ref)
+        server = scenario_es_save_failure_then_kill(runs_dir, log_dir, server,
+                                                    es_ref)
+        scenario_es_validation(server.port)
+        scenario_es_no_trigger(server.port)
     finally:
         server.stop()
 
